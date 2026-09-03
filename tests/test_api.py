@@ -130,6 +130,69 @@ def test_check_hf_model_returns_text_report_for_valid_fake_repo() -> None:
     assert result_by_id(report.results, "text/tokenizer.files").status == "pass"
 
 
+def test_check_local_model_runs_vlm_plugin_with_weight_checks(tmp_path: Path) -> None:
+    model = write_vlm_local_model(tmp_path)
+
+    report = check_local_model(model, plugin_name="vlm")
+
+    assert report.plugin == "vlm"
+    ids = {result.check_id for result in report.results}
+    assert "vlm/image_processor" in ids
+    assert "vlm/image_token.wiring" in ids
+    assert "vlm/safetensors.offsets" in ids
+    assert "text/vlm.image_processor" not in ids
+
+
+def test_check_local_model_vlm_skip_weights_excludes_only_weight_checks(
+    tmp_path: Path,
+) -> None:
+    model = write_vlm_local_model(tmp_path)
+    options = CheckOptions(
+        max_memory_bytes=None,
+        context_length=4096,
+        include_weights=False,
+        smoke=False,
+        verbosity="normal",
+    )
+
+    report = check_local_model(model, plugin_name="vlm", options=options)
+    ids = {result.check_id for result in report.results}
+
+    assert "vlm/image_token.wiring" in ids
+    assert "vlm/safetensors.offsets" not in ids
+    assert "vlm/weights.param_count" not in ids
+    assert "vlm/weights.tied_embedding" not in ids
+    assert "vlm/quantization.shape" not in ids
+
+
+def test_check_local_model_vlm_smoke_gate_blocks_on_tiny_budget(tmp_path: Path) -> None:
+    model = write_vlm_local_model(tmp_path)
+    # A measurable weight file lets the memory pre-flight gate compute a lower
+    # bound; without one, VlmMemoryEstimateCheck has nothing to estimate from
+    # and the gate can never engage.
+    (model / "model.safetensors").write_bytes(b"\x00" * 4096)
+    options = CheckOptions(
+        max_memory_bytes=1,
+        context_length=4096,
+        include_weights=False,
+        smoke=True,
+        verbosity="normal",
+    )
+
+    report = check_local_model(model, plugin_name="vlm", options=options)
+
+    assert result_by_id(report.results, "vlm/smoke.memory_budget").status == "fail"
+
+
+def test_check_hf_model_runs_vlm_plugin_for_fake_repo() -> None:
+    hub = FakeHub(files=valid_vlm_hf_files())
+
+    report = check_hf_model("org/vlm", plugin_name="vlm", hub=hub)
+
+    assert report.plugin == "vlm"
+    assert result_by_id(report.results, "vlm/image_processor").status == "pass"
+
+
 def test_check_hf_model_reports_missing_config_without_crashing() -> None:
     hub = FakeHub(files={"tokenizer.json": b"{}"})
 
@@ -344,6 +407,14 @@ def write_local_model(root: Path) -> Path:
     return model
 
 
+def write_vlm_local_model(root: Path) -> Path:
+    model = root / "vlm"
+    model.mkdir()
+    for name, data in valid_vlm_hf_files().items():
+        (model / name).write_bytes(data)
+    return model
+
+
 def result_by_id(results, check_id: str):
     return next(result for result in results if result.check_id == check_id)
 
@@ -363,6 +434,29 @@ def valid_hf_files() -> dict[str, bytes]:
         "quantization": {"bits": 4, "group_size": 64},
     }
     return {"config.json": json.dumps(config).encode(), "tokenizer.json": b"{}"}
+
+
+def valid_vlm_hf_files() -> dict[str, bytes]:
+    config = {
+        "model_type": "qwen2_5_vl",
+        "vision_config": {},
+        "image_token_id": 151655,
+        "quantization": {"bits": 4, "group_size": 64},
+        "pad_token_id": 0,
+        "eos_token_id": 1,
+    }
+    tokenizer_config = {
+        "added_tokens_decoder": {"151655": {"content": "<|image_pad|>"}},
+        "extra_special_tokens": {"image_token": "<|image_pad|>"},
+        "chat_template": "<|vision_start|><|image_pad|><|vision_end|>",
+    }
+    preproc = {"image_processor_type": "Qwen2VLImageProcessor"}
+    return {
+        "config.json": json.dumps(config).encode(),
+        "tokenizer.json": b"{}",
+        "tokenizer_config.json": json.dumps(tokenizer_config).encode(),
+        "preprocessor_config.json": json.dumps(preproc).encode(),
+    }
 
 
 class FakeSibling:

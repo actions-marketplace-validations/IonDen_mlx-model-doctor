@@ -15,9 +15,13 @@ from mlx_model_doctor.checks.quantization import (
     QuantizationMetadataCheck,
 )
 from mlx_model_doctor.checks.safetensors import SafetensorsIndexCheck, SafetensorsOffsetScanCheck
-from mlx_model_doctor.checks.smoke import MlxLmSmokeCheck
+from mlx_model_doctor.checks.smoke import MlxLmSmokeCheck, MlxVlmSmokeCheck
 from mlx_model_doctor.checks.tokenizer import SpecialTokensCheck, TokenizerFilesCheck
-from mlx_model_doctor.checks.vlm import VlmImageProcessorCheck
+from mlx_model_doctor.checks.vlm import (
+    VlmImageProcessorCheck,
+    VlmImageTokenWiringCheck,
+    VlmMemoryEstimateCheck,
+)
 from mlx_model_doctor.checks.weights import TiedEmbeddingCheck, WeightParamCountCheck
 
 __all__ = [
@@ -30,6 +34,7 @@ __all__ = [
     "MlxLmSmokeCheck",
     "MlxQuantShapeCheck",
     "MlxQuantizationModeCheck",
+    "MlxVlmSmokeCheck",
     "ModelTypeCheck",
     "QuantizationMetadataCheck",
     "RequiredConfigCheck",
@@ -39,5 +44,7 @@ __all__ = [
     "TiedEmbeddingCheck",
     "TokenizerFilesCheck",
     "VlmImageProcessorCheck",
+    "VlmImageTokenWiringCheck",
+    "VlmMemoryEstimateCheck",
     "WeightParamCountCheck",
 ]

@@ -5,6 +5,26 @@ as priorities change.
 
 ## Released
 
+- **v0.8.0** (2026-08-11) — trust and depth. Version-bound check tables (MLX
+  quantization modes, safetensors dtypes) now warn instead of failing on a
+  recognized-but-unlisted value, each annotated with the upstream version it
+  was verified against, and the project's development status moves from
+  Alpha to Beta. The VLM profile gets its first runtime check: `--smoke
+  --plugin vlm` loads a model through `mlx-vlm` and generates from a dummy
+  image under advisory memory caps, refusing remote code execution by
+  default. `sample hf` can now scan deeper into an author's catalog
+  (`--max-candidates`), filter by listing-visible MLX signal
+  (`--signal-filter`), and cache Hub listing responses locally (`--no-cache`
+  / `--cache-ttl`). The batch schema moves to `sample-batch/1.1` for the new
+  optional fields.
+- **v0.7.0** (2026-07-08) — reach/readiness plus first explicit VLM breadth.
+  Keeps `text` defaults, schemas, exit codes, and runtime smoke/load behavior
+  unchanged while adding `--plugin vlm` for non-runtime VLM metadata and
+  safetensors-header validation. It also adds a producer pre-upload workflow for
+  Hugging Face publishing, verifies the GitHub Marketplace Action listing,
+  introduces an adoption-scorecard process for release decisions, records the
+  profile-routing decision, and removes the stale docs-site milestone from the
+  active 1.0 path.
 - **v0.6.2** (2026-07-02) — a correctness and hardening patch. The memory estimate now
   passes a repository within budget and fails one that exceeds `--max-memory`, instead
   of always warning, so `--fail-on warn` works on a clean repo and `--max-memory` gates
@@ -90,15 +110,13 @@ Direction informed by a survey of how MLX / Hugging Face repos actually break
 (2026-06-04). The theme: catch more of the "loads fine, then fails or generates
 garbage" class of problems statically, before a load attempt.
 
-- **More check plugins beyond `text`** — vision-language, embedding, and other
-  model families, each with its own ordered check list (the plugin protocol is
-  already in place). The v0.4.0 vision-language image-processor check runs gated
-  inside the `text` plugin today; a dedicated `vlm` plugin would group it with
-  further vision-language checks.
-- **Richer Hugging Face surveying** — caching, broader candidate signals, and
-  pagination so `sample hf` can cover more of an author's catalog.
-- **A docs site** — the `mkdocs-material` group is wired, but there's no
-  published site yet.
+- **Post-VLM hardening** — VLM-aware sampling and further VLM-specific
+  checks as evidence demands.
+- **Richer Hugging Face surveying** — broader candidate signals and
+  survey-level diagnostics beyond the v0.8.0 caching and signal filter.
+- **Documentation expansion** — README and EXAMPLES remain the source of truth for
+  now. A separate docs site stays deferred until the adoption scorecard shows docs
+  discovery or reference depth is the release bottleneck.
 
 ## Out of scope (deliberate non-goals)
 
