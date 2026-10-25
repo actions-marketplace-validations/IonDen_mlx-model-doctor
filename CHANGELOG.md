@@ -5,6 +5,132 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.2] — 2026-10-24
+
+The safetensors index check now tells a stale index apart from missing weights,
+and `check hf` and `check local` agree on repositories with nested component
+indexes.
+
+### Fixed
+- A stale safetensors index now gets a medium warning, not a failure. Some
+  repositories ship a `model.safetensors.index.json` naming shards that are
+  absent, next to other shards that ship
+  (`mlx-community/Mistral-Small-3.1-24B-Instruct-2503-6bit`: 10 absent,
+  4 shipped). The warning gives both counts and suggests regenerating or
+  removing the index; the weight checks then read the shipped shards. A shard
+  counts as shipped only if both loaders would take it: a top-level
+  `model*.safetensors` other than `consolidated.safetensors`.
+  `weights.safetensors` and `consolidated.safetensors` still fail, since
+  mlx-lm's glob matches neither. No load was run. mlx-lm (0.31.3) globs
+  `model*.safetensors` and never reads the index; mlx-vlm (0.6.12, 0.7.x) keeps
+  the named shards that exist, else globs `*.safetensors` minus
+  `consolidated.safetensors`. [mlx-vlm issue 624](https://github.com/Blaizzy/mlx-vlm/issues/624),
+  fixed by [PR 638](https://github.com/Blaizzy/mlx-vlm/pull/638), has an opener
+  who writes: "Model loads and works correctly in mlx-lm/mlx-vlm despite index
+  mismatch."
+- An index whose named shards are some or all missing, with no loader-eligible
+  shard shipped, now produces a full report on `check hf`. `text/safetensors.index`
+  and `text/safetensors.offsets` fail and the command exits 1. The index check
+  names the first missing shard, and the full sorted list is in its details.
+  Only the offsets message lists the absent shards: up to 8 names, then
+  "and N more". It used to stop with a bare Hub 404 and exit 2.
+  Other Hub errors, such as an auth failure or a dropped connection, still exit 2.
+- `check local` and `check hf` now give the same result on a repository with a
+  nested component index, such as `text_encoder/model.safetensors.index.json`.
+  Both read only the root index for the header, as the Hub client does, so
+  `check local` no longer warns `text/weights.param_count` about a component's
+  tensors. The nested index is still validated by `text/safetensors.index`.
+  On `check local`, a root index with some or all of its named shards missing
+  and no loader-eligible shard shipped now reports a header error
+  (`text/safetensors.offsets` fails and `text/weights.param_count` is skipped),
+  which matches `check hf`. A stale index still reads its shipped shards, as
+  in the first item.
+- `check hf` no longer prints the `Parse safetensors files` progress bar on stderr.
+
+### Behavior changes
+On `check hf`, a stale index used to exit 2 by default (exit 1 with
+`--skip-weights`). It now passes with a warning under the default `--fail-on error`
+and exits 0. If your CI should still fail on it, use `--fail-on warn`. A
+repository whose index names missing shards, with no loader-eligible shard
+shipped, now exits 1 with a report where it used to exit 2 with a 404, so a script that treated exit 2 as "could not check"
+will now see a failed check instead.
+
+## [0.9.1] — 2026-09-12
+
+A false-positive cleanup. Four checks were flagging valid, popular repositories;
+each now passes, while the genuine problems they were meant to catch still fail.
+
+### Fixed
+- The safetensors index check no longer reports a false "missing shard" for a
+  repository whose weight index sits in a subdirectory. An index at
+  `text_encoder/model.safetensors.index.json` names its shards relative to its
+  own directory, so `0.safetensors` there means `text_encoder/0.safetensors`.
+  The check had instead looked for those names at the repository root and failed
+  a valid repository (for example a diffusion model's text encoder). Shard names
+  are now resolved relative to the index file, so a multi-component repository
+  passes, while a genuinely missing shard still fails and is reported at its
+  full path.
+- The tied-embedding check no longer warns when `tie_word_embeddings` is absent
+  from `config.json`. mlx-lm's model configs default that setting to true (llama
+  and qwen2, for example), and tie-by-default families like Gemma ship no
+  separate output head, so an MLX repo with the key absent loads fine and its
+  absence is not an inconsistency. An explicit `tie_word_embeddings: false` with
+  no stored output head still warns.
+- The VLM image-token check now recognizes `[IMG]`, the image placeholder used
+  by Pixtral and Mistral-3, so those repositories no longer warn that their
+  image token is not an actual placeholder.
+- The chat-template checks now read `chat_template.json`, the file transformers
+  processors and mlx-vlm actually use. A repository that keeps its template
+  there (common for vision-language models) is no longer reported as having no
+  chat template, and the end-of-turn-token check reads the template the runtime
+  will use rather than a stale copy in `tokenizer_config.json`.
+
+## [0.9.0] — 2026-09-12
+
+Adds an adapter-parity verifier: a way to check whether fusing a LoRA adapter
+into a base model actually kept the behavior the adapter learned. Fusing is
+supposed to be lossless, but with mlx-lm's default path it often is not, and
+until now you had no cheap way to tell before shipping the fused model.
+
+### Added
+- `mlx-model-doctor parity mlx --base <B> --adapter <A> --fused <F>` and the
+  `check_adapter_parity` Python API. It runs the same teacher-forced input
+  through three models — the base alone, the base with the adapter loaded, and
+  the fused model — and compares their top-token predictions. The verdict says
+  whether the fused model tracks base+adapter (`pass`), fell back to the base
+  and lost the adapter (`fail_tracks_base`), matches neither (`fail_gross`), or
+  can't be told apart within measurement noise (`inconclusive`). Each model
+  loads in its own memory-capped subprocess, one at a time, so the check is
+  safe to run on a laptop.
+- `parity mlx --prompts <file>` builds the comparison fixture from your own
+  examples. Pass a JSON list of `{"prompt", "completion"}` pairs and the tool
+  tokenizes them with the base model's own tokenizer and scores the completion
+  tokens — so you check parity on text that matters for your model, not a
+  stand-in. Without it, the built-in fixture only fits its reference tokenizer
+  and a real model is refused with a message pointing you at `--prompts`.
+- `parity.v1` JSON schema for `parity mlx --format json` (shipped in the wheel,
+  validated against real output in the test suite), plus `text` and `markdown`
+  renderers. Exit codes: `0` parity confirmed, `1` a determined regression
+  (the fuse reverted to base, or a static incompatibility), `2` can't determine
+  (inconclusive, a worker failure, or a setup error).
+- Requires the optional `[mlx-lm]` extra for the runtime comparison, and a base
+  repository that ships a `tokenizer.json`. Point `--base`/`--adapter`/`--fused`
+  at directories of real files (a converted/fused model, or `hf download <repo>
+  --local-dir ./dir`), not the raw Hugging Face cache snapshot path, whose
+  symlinks the checker does not yet follow.
+
+### Changed
+- The verifier reports a degraded 4-bit fuse as `inconclusive` rather than a
+  false `pass`. The reason it needs to: mlx-lm's default fuse re-quantizes the
+  merged weights back to the base's format, and that round-trip erases part of
+  the adapter's contribution. On a small text-to-SQL LoRA the default 4-bit fuse
+  kept only about half the adapter's effect, while fusing with `--dequantize` (a
+  float fuse) kept nearly all of it. If you fuse for distribution, prefer
+  `--dequantize`, or run this check first.
+- The optional `[mlx-lm]` extra now pins `mlx-lm>=0.31.3,<0.32` and
+  `mlx>=0.32,<0.33` — the versions the parity check was verified against. This
+  also backs the existing `--smoke` runtime check.
+
 ## [0.8.0] — 2026-08-11
 
 A trust-and-depth release. Version-bound check tables now warn rather than
@@ -46,10 +172,6 @@ A reach/readiness minor release plus the first explicit non-text validation
 profile. It adds a non-runtime `vlm` plugin for vision-language repositories
 while keeping `text` as the default, preserving existing `text/...` check IDs,
 leaving JSON schemas unchanged, and not adding runtime smoke/load behavior.
-
-Release gate: after the `v0.7.0` semver release publishes successfully, move the
-moving `v0` Action tag to the release commit, confirm the remote `v0` SHA matches
-that commit, and confirm the release workflow did not run from the bare `v0` tag.
 
 ### Added
 - Explicit `vlm` plugin (`--plugin vlm`) for vision-language repositories. It

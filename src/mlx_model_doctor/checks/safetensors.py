@@ -1,6 +1,7 @@
 """Checks for safetensors index metadata."""
 
 import json
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import cast
 
@@ -8,8 +9,13 @@ from mlx_model_doctor.context import _MAX_METADATA_BYTES, CheckContext
 from mlx_model_doctor.errors import TargetError, raise_for_hf_target_error
 from mlx_model_doctor.report import CheckResult
 from mlx_model_doctor.safetensors_header import FileHeader
-
-SAFETENSORS_INDEX_SUFFIX = ".safetensors.index.json"
+from mlx_model_doctor.shard_layout import (
+    SAFETENSORS_INDEX_SUFFIX,
+    ShardLayoutKind,
+    classify_shard_layout,
+    printable_name,
+    resolve_shard_path,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -22,12 +28,9 @@ class SafetensorsIndexCheck:
     def run(self, ctx: CheckContext) -> CheckResult:
         """Return whether the safetensors index references present shard files."""
         try:
+            files = tuple(ctx.target.list_files())
             index_paths = tuple(
-                sorted(
-                    path
-                    for path in ctx.target.list_files()
-                    if path.endswith(SAFETENSORS_INDEX_SUFFIX)
-                )
+                sorted(path for path in files if path.endswith(SAFETENSORS_INDEX_SUFFIX))
             )
         except TargetError as exc:
             raise_for_hf_target_error(exc)
@@ -50,13 +53,27 @@ class SafetensorsIndexCheck:
             )
 
         all_shards: set[str] = set()
+        stale: CheckResult | None = None
         for index_path in index_paths:
-            result = _validate_index(ctx, self.check_id, self.title, index_path)
+            result = _validate_index(ctx, self.check_id, self.title, index_path, files)
+            # The status test is defensive: _validate_index retags an invalid reference to
+            # all_missing, so a stale layout only ever comes back as a warn.
+            if (
+                result.status == "warn"
+                and result.details.get("shard_layout")
+                == ShardLayoutKind.STALE_ALL_ABSENT_WITH_SHIPPED
+            ):
+                # A stale root index is a warning; keep validating so a later index with
+                # genuinely missing shards still fails.
+                stale = stale or result
+                continue
             if result.status != "pass":
                 return result
             shards = result.details.get("shards")
             if isinstance(shards, tuple):
                 all_shards.update(shard for shard in shards if isinstance(shard, str))
+        if stale is not None:
+            return stale
 
         details: dict[str, object] = {
             "index_paths": index_paths,
@@ -75,11 +92,29 @@ class SafetensorsIndexCheck:
         )
 
 
+def _shards(count: int) -> str:
+    return "shard" if count == 1 else "shards"
+
+
+def _are(count: int) -> str:
+    return "is" if count == 1 else "are"
+
+
+def _ship(count: int) -> str:
+    return "ships" if count == 1 else "ship"
+
+
+def _outside_repository(shard: str) -> bool:
+    """Return whether a resolved shard path leaves the repository (``..`` or absolute)."""
+    return shard == ".." or shard.startswith(("../", "/"))
+
+
 def _validate_index(
     ctx: CheckContext,
     check_id: str,
     title: str,
     index_path: str,
+    files: Sequence[str],
 ) -> CheckResult:
     try:
         size = ctx.target.size(index_path)
@@ -163,7 +198,15 @@ def _validate_index(
             details={"index_path": index_path},
         )
 
-    shard_names = tuple(sorted({value for value in weight_map.values() if isinstance(value, str)}))
+    shard_names = tuple(
+        sorted(
+            {
+                resolve_shard_path(index_path, value)
+                for value in weight_map.values()
+                if isinstance(value, str)
+            }
+        )
+    )
     if not shard_names:
         return CheckResult(
             check_id=check_id,
@@ -178,6 +221,11 @@ def _validate_index(
     missing_shards: list[str] = []
     invalid_shards: list[str] = []
     for shard in shard_names:
+        if _outside_repository(shard):
+            # Judged here, not by the target, so every target fails it the same way.
+            missing_shards.append(shard)
+            invalid_shards.append(shard)
+            continue
         try:
             shard_exists = ctx.target.exists(shard)
         except TargetError as exc:
@@ -193,20 +241,59 @@ def _validate_index(
             missing_shards.append(shard)
 
     if missing_shards:
-        first_missing = missing_shards[0]
+        missing_set = frozenset(missing_shards)
+        layout = classify_shard_layout(
+            files,
+            {key: value for key, value in weight_map.items() if isinstance(value, str)},
+            index_path=index_path,
+            # The same presence verdict as above (target.exists), so the two agree.
+            present=lambda shard: shard not in missing_set,
+        )
+        kind = layout.kind
+        if kind is ShardLayoutKind.STALE_ALL_ABSENT_WITH_SHIPPED and invalid_shards:
+            # An invalid reference is never stale: every named shard is unusable.
+            kind = ShardLayoutKind.ALL_MISSING
+        details: dict[str, object] = {
+            "index_path": index_path,
+            "missing_shards": tuple(missing_shards),
+            "invalid_shards": tuple(invalid_shards),
+            "shards": shard_names,
+            "shard_layout": str(kind),
+        }
+        shown_index = printable_name(index_path)
+        if kind is ShardLayoutKind.STALE_ALL_ABSENT_WITH_SHIPPED:
+            absent = len(layout.absent)
+            shipped = len(layout.shipped)
+            return CheckResult(
+                check_id=check_id,
+                title=title,
+                status="warn",
+                severity="medium",
+                message=(
+                    f"Safetensors index {shown_index} is stale: it names {absent} "
+                    f"{_shards(absent)} that {_are(absent)} absent from the repository, while "
+                    f"{shipped} other {_shards(shipped)} {_ship(shipped)}. mlx-lm never reads "
+                    "the index and loads model*.safetensors; mlx-vlm falls back to the shipped "
+                    "shards when none of the named ones exist. Loaders that follow the index, "
+                    "and huggingface_hub's get_safetensors_metadata, fail."
+                ),
+                remediation=(
+                    f"Regenerate {shown_index} from the shipped shards, or remove the stale index."
+                ),
+                details={**details, "shipped_shards": layout.shipped},
+            )
+        first_missing = printable_name(missing_shards[0])
         return CheckResult(
             check_id=check_id,
             title=title,
             status="fail",
             severity="high",
-            message=f"Safetensors index {index_path} references invalid or missing shard {first_missing}.",
+            message=(
+                f"Safetensors index {shown_index} references invalid or missing shard "
+                f"{first_missing}."
+            ),
             remediation="Add the missing safetensors shard or fix the index weight_map.",
-            details={
-                "index_path": index_path,
-                "missing_shards": tuple(missing_shards),
-                "invalid_shards": tuple(invalid_shards),
-                "shards": shard_names,
-            },
+            details=details,
         )
 
     return CheckResult(
