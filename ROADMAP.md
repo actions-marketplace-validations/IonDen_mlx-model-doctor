@@ -5,6 +5,25 @@ as priorities change.
 
 ## Released
 
+- **v0.10.3** (2026-11-25) — failure messages from `--smoke` and `parity mlx`,
+  the error line of a failed Hugging Face download, and Hub errors from
+  `check hf` and `sample hf` now shorten local folder paths.
+  `check_adapter_parity` raises `TargetError` instead of the
+  underlying error when a Hub download fails.
+- **v0.10.2** (2026-11-17) — the `[mlx-lm]` and `[mlx-vlm]` extras follow MLX
+  0.32, mlx-lm 0.32 and mlx-vlm 0.6.12 to 0.7 (MLX 0.32.4 or later, mlx-lm
+  0.32.0 or later), and a text `--smoke` load that fails on a repository
+  naming `auto_map` code no longer puts your home folder path in the upstream
+  error kept in the report details.
+- **v0.10.1** (2026-11-16) — `--smoke` and `parity mlx` refuse to load a
+  repository that names its own loader code or, on VLM `--smoke`, ships a chat
+  template for one of six processor families.
+- **v0.10.0** (2026-11-13) — Hugging Face cache snapshots. `check local` and
+  `parity mlx` now work directly on a model in your Hugging Face cache, including
+  one downloaded with huggingface_hub 1.x or 2.x, so there is no need to copy it to a
+  real-file directory first. Other symlinks that point outside the model
+  directory are still refused. 1-bit affine quantization is accepted as of MLX
+  0.32.4 and no longer warns.
 - **v0.9.2** (2026-10-24) — a stale safetensors index no longer reads as
   missing weights. When an index names shards that are absent but the repository
   ships other shards that mlx-lm and mlx-vlm load, `check` now warns that the

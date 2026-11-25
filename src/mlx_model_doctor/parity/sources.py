@@ -19,8 +19,24 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
-from mlx_model_doctor.errors import ModelDoctorError
+from mlx_model_doctor.errors import ModelDoctorError, TargetError
 from mlx_model_doctor.parity.report import ResolvedIdentity
+from mlx_model_doctor.redaction import redact_local_paths
+
+# The text smoke list (mlx-lm 0.31.3 utils._download minus "*.py") plus the two files
+# mlx-lm 0.31.3 tuner/utils.py load_adapters reads from an adapter folder.
+_PARITY_SNAPSHOT_PATTERNS = (
+    "*.json",
+    "model*.safetensors",
+    "tokenizer.model",
+    "*.tiktoken",
+    "tiktoken.model",
+    "*.txt",
+    "*.jsonl",
+    "*.jinja",
+    "adapter_config.json",
+    "adapters.safetensors",
+)
 
 
 class SnapshotDownloader(Protocol):
@@ -34,10 +50,23 @@ class DefaultSnapshotDownloader:
     """Real :class:`SnapshotDownloader` backed by ``huggingface_hub.snapshot_download``."""
 
     def snapshot(self, repo_id: str) -> str:
-        """Snapshot-download a full repository and return its local cache path."""
+        """Snapshot-download the files a parity load reads and return the folder."""
         from huggingface_hub import snapshot_download
 
-        return snapshot_download(repo_id=repo_id)
+        # allow_patterns: huggingface_hub 1.19.0 snapshot_download keyword. The same
+        # downloader fetches base, fused and adapter repositories, so the list is the
+        # mlx-lm one plus the adapter files. It does not download .py files.
+        try:
+            return snapshot_download(
+                repo_id=repo_id, allow_patterns=list(_PARITY_SNAPSHOT_PATTERNS)
+            )
+        except Exception as exc:
+            raise TargetError(
+                f"Could not download a snapshot of Hugging Face model {repo_id}: "
+                f"{redact_local_paths(str(exc))}",
+                target=repo_id,
+                source="hf",
+            ) from exc
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)

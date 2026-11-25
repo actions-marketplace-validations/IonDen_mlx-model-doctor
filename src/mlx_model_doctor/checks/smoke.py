@@ -3,16 +3,64 @@
 import importlib
 import os
 import sys
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Protocol, cast
+from typing import TYPE_CHECKING, Protocol, cast
 
+from mlx_model_doctor.checks.remote_code import (
+    KEY_REMEDIATION,
+    MLX_LM_KEYS,
+    MLX_VLM_KEYS,
+    AutoMapLoadError,
+    RemoteCodeKeys,
+    RemoteCodeRefusedError,
+    TemplateRendererRefusedError,
+    describe_auto_map_load_failure,
+    describe_refusal,
+    describe_template_renderer_refusal,
+    find_auto_map,
+    find_remote_code,
+    find_template_renderer,
+    refusal_remediation,
+    template_renderer_remediation,
+)
 from mlx_model_doctor.context import CheckContext
 from mlx_model_doctor.environment import format_install_hint, has_uv_context
 from mlx_model_doctor.errors import DependencyError, MemorySafetyError, ModelDoctorError
 from mlx_model_doctor.memory import install_mlx_memory_caps
+from mlx_model_doctor.redaction import redact_local_paths, target_model_dirs
 from mlx_model_doctor.report import CheckResult
+from mlx_model_doctor.targets import HfTarget
+
+if TYPE_CHECKING:
+    from mlx_model_doctor.targets import ModelTarget
+
+# The files each loader would download for a Hub repo id, minus "*.py": mlx-lm 0.32.2
+# utils.DEFAULT_ALLOW_PATTERNS (the 0.31.3 list) and mlx-vlm 0.7.12 utils.get_model_path
+# (read 2026-11-16; 0.7.x adds "*.jsonl" to the 0.6.12 list, which plamo2vl's
+# tokenizer.jsonl needs). tests/test_upstream_surface.py compares both lists with the
+# installed loaders. The smoke load runs from this local snapshot. The download does not fetch .py files; the folder
+# may still hold some from an earlier full download, which is why the guard reads it.
+_MLX_LM_SNAPSHOT_PATTERNS = (
+    "*.json",
+    "model*.safetensors",
+    "tokenizer.model",
+    "*.tiktoken",
+    "tiktoken.model",
+    "*.txt",
+    "*.jsonl",
+    "*.jinja",
+)
+_MLX_VLM_SNAPSHOT_PATTERNS = (
+    "*.json",
+    "*.jsonl",
+    "*.safetensors",
+    "*.model",
+    "*.tiktoken",
+    "*.txt",
+    "*.jinja",
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -22,6 +70,7 @@ class SmokeGeneration:
     text: str
     peak_memory_bytes: int | None = None
     memory_caps_gib: tuple[int, int] | None = None
+    snapshot_revision: str | None = None
 
 
 class SmokeBackend(Protocol):
@@ -53,7 +102,9 @@ class MlxCoreSmokeModule(Protocol):
 class MlxLmModule(Protocol):
     """mlx-lm API surface used by the smoke backend."""
 
-    def load(self, path_or_repo: str) -> tuple[object, object]:
+    def load(
+        self, path_or_hf_repo: str, tokenizer_config: dict[str, object] | None = None
+    ) -> tuple[object, object]:
         """Load a model and tokenizer."""
 
     def generate(
@@ -82,8 +133,26 @@ class MlxLmBackend:
             raise MemorySafetyError(
                 "MLX memory caps could not be installed; refusing to load model uncapped."
             )
+        model_dir, revision = _checked_model_dir(
+            ctx.target, allow_patterns=_MLX_LM_SNAPSHOT_PATTERNS, keys=MLX_LM_KEYS
+        )
         mx.reset_peak_memory()
-        model, tokenizer = mlx_lm.load(ctx.target.name)
+        try:
+            model, tokenizer = mlx_lm.load(
+                str(model_dir), tokenizer_config={"trust_remote_code": False}
+            )
+        except ModelDoctorError:
+            raise
+        except Exception as exc:
+            # transformers' own text advises trust_remote_code=True; replace it.
+            auto_map_file = find_auto_map(model_dir)
+            if auto_map_file is None:
+                raise
+            raise AutoMapLoadError(
+                auto_map_file,
+                upstream_error=redact_local_paths(str(exc), model_dirs=(model_dir,)),
+                revision=revision,
+            ) from exc
         text = mlx_lm.generate(
             model,
             tokenizer,
@@ -95,7 +164,112 @@ class MlxLmBackend:
             text=text,
             peak_memory_bytes=mx.get_peak_memory(),
             memory_caps_gib=caps_gib,
+            snapshot_revision=revision,
         )
+
+
+def _checked_model_dir(
+    target: "ModelTarget", *, allow_patterns: Sequence[str], keys: RemoteCodeKeys
+) -> tuple[Path, str | None]:
+    """Return the local directory to load and its snapshot revision, after the guard.
+
+    A Hugging Face target is downloaded first, so the guard and the loader see the same
+    files. Raises ``RemoteCodeRefusedError`` when the directory names loader code from
+    ``keys``, or a guarded file cannot be read.
+    """
+    revision: str | None = None
+    if target.source == "hf":
+        if not isinstance(target, HfTarget):
+            raise TypeError(
+                f"the smoke load needs a local snapshot of {target.name}, "
+                "and this target cannot provide one"
+            )
+        snapshot = target.snapshot(allow_patterns=allow_patterns)
+        root, revision = snapshot.path, snapshot.revision
+    else:
+        root = Path(target.name)
+    try:
+        model_dir: Path | None = root.resolve(strict=True)
+    except (OSError, RuntimeError):
+        model_dir = None
+    if model_dir is None or not model_dir.is_dir():
+        raise NotADirectoryError(f"model path is not an existing directory: {root}")
+    refusal = find_remote_code(model_dir, keys=keys)
+    if refusal is not None:
+        raise RemoteCodeRefusedError(refusal, revision=revision)
+    return model_dir, revision
+
+
+def _remote_code_result(check_id: str, title: str, exc: RemoteCodeRefusedError) -> CheckResult:
+    refusal = exc.refusal
+    details: dict[str, object] = {"remote_code_file": refusal.file}
+    if refusal.key is None:
+        details["remote_code_unreadable"] = True
+        if refusal.reason == "dangling_link":
+            details["remote_code_dangling_link"] = True
+        outcome = "The load was refused, so repository code was not run."
+    else:
+        details["remote_code_key"] = refusal.key
+        outcome = "The load was refused, so that code was not run."
+    message = f"{describe_refusal(refusal)} {outcome} The static checks above still ran."
+    remediation = refusal_remediation(refusal)
+    if exc.revision is not None:
+        details["snapshot_revision"] = exc.revision
+    return CheckResult(
+        check_id=check_id,
+        title=title,
+        status="fail",
+        severity="high",
+        message=message,
+        remediation=remediation,
+        details=details,
+    )
+
+
+def _template_renderer_result(
+    check_id: str, title: str, exc: TemplateRendererRefusedError
+) -> CheckResult:
+    refusal = exc.refusal
+    details: dict[str, object] = {}
+    if refusal.renderer is not None:
+        details["remote_code_renderer"] = refusal.renderer
+    if refusal.reason == "unreadable":
+        details["remote_code_file"] = refusal.file
+        details["remote_code_unreadable"] = True
+    else:
+        details["remote_code_template_source"] = refusal.file
+    if exc.revision is not None:
+        details["snapshot_revision"] = exc.revision
+    return CheckResult(
+        check_id=check_id,
+        title=title,
+        status="fail",
+        severity="high",
+        message=(
+            f"{describe_template_renderer_refusal(refusal)} The static checks above still ran."
+        ),
+        remediation=template_renderer_remediation(refusal),
+        details=details,
+    )
+
+
+def _auto_map_load_result(check_id: str, title: str, exc: AutoMapLoadError) -> CheckResult:
+    details: dict[str, object] = {
+        "remote_code_file": exc.file,
+        "remote_code_key": "auto_map",
+        "upstream_error": exc.upstream_error,
+    }
+    if exc.revision is not None:
+        details["snapshot_revision"] = exc.revision
+    return CheckResult(
+        check_id=check_id,
+        title=title,
+        status="fail",
+        severity="high",
+        message=f"{describe_auto_map_load_failure(exc.file)} The static checks above still ran.",
+        remediation=KEY_REMEDIATION,
+        details=details,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -112,13 +286,18 @@ class MlxLmSmokeCheck:
             generation = self.backend.generate(ctx)
         except ModelDoctorError:
             raise
+        except RemoteCodeRefusedError as exc:
+            return _remote_code_result(self.check_id, self.title, exc)
+        except AutoMapLoadError as exc:
+            return _auto_map_load_result(self.check_id, self.title, exc)
         except Exception as exc:
+            reason = redact_local_paths(str(exc), model_dirs=target_model_dirs(ctx.target))
             return CheckResult(
                 check_id=self.check_id,
                 title=self.title,
                 status="fail",
                 severity="high",
-                message=f"Smoke generation failed: {exc}",
+                message=f"Smoke generation failed: {reason}",
                 remediation="Inspect the model with mlx-lm directly before using it.",
             )
 
@@ -144,15 +323,16 @@ class MlxLmSmokeCheck:
         )
 
 
+# Checked against mlx-vlm 0.6.12 with ``inspect.signature`` on the installed package, and
+# against 0.7.12 by tests/test_upstream_surface.py on 2026-11-16 (the same signatures).
 class MlxVlmModule(Protocol):
     """mlx-vlm API surface used by the VLM smoke backend.
 
-    Signatures verified against mlx-vlm==0.6.12 (via ``inspect.signature``
-    against the installed package): ``load`` and ``generate`` accept many
-    more parameters via ``**kwargs`` than declared here; only the ones this
-    backend passes are part of this Protocol. Notably ``apply_chat_template``
-    requires a model-config argument (``processor, config, prompt, ...``),
-    unlike the plan's initial assumption of a two-argument call.
+    Signatures checked against mlx-vlm 0.7.12 by the test suite and, earlier, against
+    0.6.12 with ``inspect.signature``. ``load`` and ``generate`` accept many more parameters via
+    ``**kwargs`` than declared here; only the ones this backend passes are part of this Protocol.
+    ``apply_chat_template`` takes a model-config argument (``processor, config, prompt, ...``),
+    not just a processor and a prompt.
     """
 
     def load(
@@ -195,8 +375,14 @@ class MlxVlmBackend:
             raise MemorySafetyError(
                 "MLX memory caps could not be installed; refusing to load VLM uncapped."
             )
+        model_dir, revision = _checked_model_dir(
+            ctx.target, allow_patterns=_MLX_VLM_SNAPSHOT_PATTERNS, keys=MLX_VLM_KEYS
+        )
+        renderer = find_template_renderer(model_dir)
+        if renderer is not None:
+            raise TemplateRendererRefusedError(renderer, revision=revision)
         mx.reset_peak_memory()
-        model, processor = vlm.load(ctx.target.name, trust_remote_code=False)
+        model, processor = vlm.load(str(model_dir), trust_remote_code=False)
         # Re-install caps after load (mlx-vlm may override wired limit during load).
         caps_gib = install_mlx_memory_caps(mx)
         if caps_gib[0] <= 0 or caps_gib[1] <= 0:
@@ -225,6 +411,7 @@ class MlxVlmBackend:
             text=text,
             peak_memory_bytes=mx.get_peak_memory(),
             memory_caps_gib=caps_gib,
+            snapshot_revision=revision,
         )
 
 
@@ -251,13 +438,18 @@ class MlxVlmSmokeCheck:
             generation = self.backend.generate(ctx)
         except ModelDoctorError:
             raise
+        except RemoteCodeRefusedError as exc:
+            return _remote_code_result(self.check_id, self.title, exc)
+        except TemplateRendererRefusedError as exc:
+            return _template_renderer_result(self.check_id, self.title, exc)
         except Exception as exc:
+            reason = redact_local_paths(str(exc), model_dirs=target_model_dirs(ctx.target))
             return CheckResult(
                 check_id=self.check_id,
                 title=self.title,
                 status="fail",
                 severity="high",
-                message=f"VLM smoke generation failed: {exc}",
+                message=f"VLM smoke generation failed: {reason}",
                 remediation="Inspect the model with mlx-vlm directly before using it.",
             )
 
@@ -293,6 +485,8 @@ def _generation_details(generation: SmokeGeneration) -> dict[str, object]:
         wired_gib, memory_gib = generation.memory_caps_gib
         details["wired_limit_gib"] = wired_gib
         details["memory_limit_gib"] = memory_gib
+    if generation.snapshot_revision is not None:
+        details["snapshot_revision"] = generation.snapshot_revision
     return details
 
 

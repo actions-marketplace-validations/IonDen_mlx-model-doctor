@@ -13,6 +13,7 @@ from mlx_model_doctor.parity.checks import (
     AdapterConfigCheck,
     FusedTargetConsistencyCheck,
     ParityCheck,
+    RemoteCodeCheck,
     TargetCoverageCheck,
     TokenizerIdentityCheck,
     resolve_targets_against_base,
@@ -45,6 +46,7 @@ from mlx_model_doctor.parity.report import (
 from mlx_model_doctor.parity.sources import ResolvedSources, SnapshotDownloader, resolve_sources
 from mlx_model_doctor.parity.worker import WorkerSpec
 from mlx_model_doctor.plugins import DoctorPlugin, get_plugin
+from mlx_model_doctor.redaction import redact_local_paths
 from mlx_model_doctor.report import CheckResult, DoctorReport, zero_check_reason_for
 from mlx_model_doctor.runners.smoke import run_smoke_checks
 from mlx_model_doctor.runners.static import run_static_checks
@@ -53,8 +55,10 @@ from mlx_model_doctor.targets import HfHubProtocol, HfTarget, LocalTarget, Model
 _ADAPTER_CONFIG_CHECK_ID = "parity/adapter.config_well_formed"
 _TOKENIZER_CHECK_ID = "parity/tokenizer.identity"
 _MISSING_TARGET_CHECK_IDS = frozenset({"parity/target.coverage", "parity/fused.target_consistency"})
+_REMOTE_CODE_CHECK_ID = "parity/load.remote_code"
 
-# The four cross-target static checks, in stable execution order (F3/F5/F6).
+# The cross-target static checks, in stable execution order (F3/F5/F6), then the
+# loader-code guard that gates every worker load.
 # Cast mirrors ``plugins.text``'s ModelCheck tuple: the frozen check dataclasses
 # implement the ``ParityCheck`` Protocol structurally, which a heterogeneous
 # tuple literal does not convey to the type checker on its own.
@@ -65,6 +69,7 @@ _PARITY_CHECKS: tuple[ParityCheck, ...] = cast(
         TargetCoverageCheck(),
         FusedTargetConsistencyCheck(),
         TokenizerIdentityCheck(),
+        RemoteCodeCheck(),
     ),
 )
 
@@ -230,15 +235,23 @@ def check_adapter_parity(
     missing_target_fail = any(_has_fail(results, cid) for cid in _MISSING_TARGET_CHECK_IDS)
     tokenizer_mismatch = _has_fail(results, _TOKENIZER_CHECK_ID)
     tokenizer_vocab_unavailable = _tokenizer_vocab_unavailable(results, _TOKENIZER_CHECK_ID)
+    # A repository that names its own loader code is never loaded. No worker runs, so
+    # the verdict stays null and parity_exit_code maps the run to 2 (cannot determine).
+    remote_code_refused = _remote_code_refused(results)
 
     if crashed:
         phase_outcomes["static"] = "error"
         reasons.append("a cross-target parity check crashed; the run cannot be trusted.")
-    elif embedded_fail or adapter_config_fail or missing_target_fail:
+    elif embedded_fail or adapter_config_fail or missing_target_fail or remote_code_refused:
         phase_outcomes["static"] = "blocking_fail"
         reasons.append("a blocking static defect prevented a valid parity run.")
     else:
         phase_outcomes["static"] = "ok"
+    if remote_code_refused:
+        reasons.append(
+            "the loader-code guard refused the base or fused model directory, so no "
+            "model was loaded."
+        )
 
     if tokenizer_mismatch:
         phase_outcomes["tokenizer_gate"] = "blocking_fail"
@@ -259,6 +272,7 @@ def check_adapter_parity(
 
     runtime_gated = (
         crashed
+        or remote_code_refused
         or embedded_fail
         or adapter_config_fail
         or missing_target_fail
@@ -412,8 +426,9 @@ def _run_runtime(
         # Surface each failed worker's captured cause (F2/F9): stderr, a timeout, an
         # artifact-validation reason, or the watchdog's memory/wall abort marker --
         # never silently dropped behind the generic "one or more workers failed" line.
+        model_dirs = (sources.base.path, sources.adapter.path, sources.fused.path)
         worker_errors = {
-            outcome.role: outcome.error
+            outcome.role: redact_local_paths(outcome.error, model_dirs=model_dirs)
             for outcome in outcomes
             if outcome.status == "error" and outcome.error is not None
         }
@@ -575,8 +590,9 @@ def _build_delta_map(
             )
         )
     except (ValueError, OSError) as exc:
+        cause = redact_local_paths(str(exc), model_dirs=(sources.base.path, sources.fused.path))
         return _DeltaMapResult(
-            deltas=(), phase="error", reason=f"delta map could not compare tensor bytes: {exc}"
+            deltas=(), phase="error", reason=f"delta map could not compare tensor bytes: {cause}"
         )
     return _DeltaMapResult(deltas=deltas, phase="ok")
 
@@ -673,3 +689,17 @@ def _dist_version(name: str) -> str | None:
         return metadata.version(name)
     except metadata.PackageNotFoundError:
         return None
+
+
+def _remote_code_refused(results: "tuple[CheckResult, ...] | list[CheckResult]") -> bool:
+    """Return whether the loader-code guard answered with a refusal.
+
+    A crash of the check is also a ``fail`` under its id, but it carries no
+    ``refused_targets`` detail; it is reported as a crash, not as a refusal.
+    """
+    return any(
+        result.check_id == _REMOTE_CODE_CHECK_ID
+        and result.status == "fail"
+        and "refused_targets" in result.details
+        for result in results
+    )

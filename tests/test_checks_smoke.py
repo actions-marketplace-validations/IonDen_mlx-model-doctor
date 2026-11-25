@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from pathlib import Path
 
 import pytest
 
@@ -7,7 +8,37 @@ from mlx_model_doctor.checks.smoke import MlxLmBackend, MlxLmSmokeCheck, SmokeGe
 from mlx_model_doctor.context import CheckContext
 from mlx_model_doctor.errors import DependencyError, MemorySafetyError, ModelDoctorError
 from mlx_model_doctor.memory import GIB
-from tests.fakes import FakeTarget, check_options
+from mlx_model_doctor.targets import HfTarget, LocalTarget
+from tests.fakes import (
+    FakeShardHub,
+    FakeTarget,
+    check_options,
+    use_fake_home,
+    write_hf_cache_snapshot,
+)
+
+# Small, known-good VLM pinned for the live canary (mlx-community, 4-bit quantized).
+CANARY_REPO = "mlx-community/Qwen2.5-VL-3B-Instruct-4bit"
+
+
+def canary_snapshot_dir(*, cache_dir: Path | None = None) -> Path:
+    """Return the canary's snapshot folder from the local Hugging Face cache only.
+
+    Never contacts the Hub. A missing snapshot fails the test: a --run-smoke run is
+    prepared on purpose, so the model must already be downloaded.
+    """
+    from huggingface_hub import snapshot_download
+    from huggingface_hub.errors import LocalEntryNotFoundError
+
+    try:
+        folder = snapshot_download(CANARY_REPO, cache_dir=cache_dir, local_files_only=True)
+    except LocalEntryNotFoundError:
+        pytest.fail(
+            f"{CANARY_REPO} is not in the local Hugging Face cache. "
+            f"Run `hf download {CANARY_REPO}` before `pytest --run-smoke`.",
+            pytrace=False,
+        )
+    return Path(folder)
 
 
 def test_mlx_lm_smoke_check_passes_for_non_empty_generation() -> None:
@@ -68,7 +99,9 @@ def test_mlx_lm_smoke_check_propagates_memory_safety_errors() -> None:
         check.run(CheckContext(target=FakeTarget(files={}), options=check_options()))
 
 
-def test_mlx_lm_backend_lazily_imports_installs_caps_and_records_peak(monkeypatch) -> None:
+def test_mlx_lm_backend_lazily_imports_installs_caps_and_records_peak(
+    monkeypatch, tmp_path: Path
+) -> None:
     mx = FakeMx()
     mlx_lm = FakeMlxLm(mx)
 
@@ -81,8 +114,9 @@ def test_mlx_lm_backend_lazily_imports_installs_caps_and_records_peak(monkeypatc
 
     monkeypatch.setattr(smoke_module.importlib, "import_module", import_module)
 
+    # The smoke load reads a real directory; an empty one carries no guarded file.
     generation = MlxLmBackend().generate(
-        CheckContext(target=FakeTarget(files={}), options=check_options())
+        CheckContext(target=FakeTarget(files={}, name=str(tmp_path)), options=check_options())
     )
 
     assert generation.text.strip()
@@ -189,7 +223,9 @@ class FakeMlxLm:
         self.load_saw_caps: tuple[int | None, int | None] | None = None
         self.generate_kwargs: dict[str, object] | None = None
 
-    def load(self, path_or_repo: str) -> tuple[object, object]:
+    def load(
+        self, path_or_repo: str, tokenizer_config: dict[str, object] | None = None
+    ) -> tuple[object, object]:
         self.load_saw_reset = self._mx.peak_was_reset
         self.load_saw_caps = (self._mx.wired_limit, self._mx.memory_limit)
         return (object(), object())
@@ -214,7 +250,9 @@ class FakeMlxLm:
 class LoadForbiddenMlxLm:
     load_calls = 0
 
-    def load(self, path_or_repo: str) -> tuple[object, object]:
+    def load(
+        self, path_or_repo: str, tokenizer_config: dict[str, object] | None = None
+    ) -> tuple[object, object]:
         self.load_calls += 1
         raise AssertionError("mlx_lm.load() must not be called without MLX memory caps")
 
@@ -233,7 +271,8 @@ class LoadForbiddenMlxLm:
 # --- VLM smoke fakes (pure Python, no real MLX) ---
 #
 # apply_chat_template's `config` parameter was added after verifying the real
-# mlx-vlm==0.6.12 signature (inspect.signature); apply_chat_template requires
+# mlx-vlm 0.6.12 signature (inspect.signature), unchanged in 0.7.12 (the
+# upstream surface tests, 2026-11-16); apply_chat_template requires
 # a model-config argument (`processor, config, prompt, ...`), unlike the
 # text-only mlx_lm.load()/generate() surface above.
 
@@ -345,7 +384,7 @@ def test_vlm_smoke_propagates_memory_safety_error() -> None:
 # --- VLM backend-level tests (FakeVlmModule + FakeMx, monkeypatched imports) ---
 
 
-def test_vlm_backend_installs_caps_loads_and_reinstalls_caps(monkeypatch) -> None:
+def test_vlm_backend_installs_caps_loads_and_reinstalls_caps(monkeypatch, tmp_path: Path) -> None:
     mx = FakeMx()
     vlm = FakeVlmModule()
 
@@ -361,7 +400,7 @@ def test_vlm_backend_installs_caps_loads_and_reinstalls_caps(monkeypatch) -> Non
     from mlx_model_doctor.checks.smoke import MlxVlmBackend
 
     generation = MlxVlmBackend(vlm_module=vlm, mx_module=mx).generate(
-        CheckContext(target=FakeTarget(files={}, name="test-vlm"), options=check_options())
+        CheckContext(target=FakeTarget(files={}, name=str(tmp_path)), options=check_options())
     )
 
     assert generation.text.strip()
@@ -410,7 +449,7 @@ def test_vlm_backend_missing_dependencies_raise_install_hint(monkeypatch) -> Non
     assert exc_info.value.extra_name == "mlx-vlm"
 
 
-def test_vlm_backend_generate_failure_returns_fail_result() -> None:
+def test_vlm_backend_generate_failure_returns_fail_result(tmp_path: Path) -> None:
     """Test that a generate-time (not load-time) exception becomes a fail result."""
     from mlx_model_doctor.checks.smoke import MlxVlmBackend, MlxVlmSmokeCheck
 
@@ -419,17 +458,18 @@ def test_vlm_backend_generate_failure_returns_fail_result() -> None:
     backend = MlxVlmBackend(vlm_module=vlm, mx_module=mx)
     check = MlxVlmSmokeCheck(backend=backend)
     result = check.run(
-        CheckContext(target=FakeTarget(files={}, name="test"), options=check_options())
+        CheckContext(target=FakeTarget(files={}, name=str(tmp_path)), options=check_options())
     )
     assert result.status == "fail"
     assert "vision encoder crash" in result.message
 
 
-def _vlm_smoke_context() -> CheckContext:
-    return CheckContext(target=FakeTarget(files={}, name="test-vlm"), options=check_options())
+def _vlm_smoke_context(model_dir: Path) -> CheckContext:
+    # The smoke load reads a real directory; an empty one carries no guarded file.
+    return CheckContext(target=FakeTarget(files={}, name=str(model_dir)), options=check_options())
 
 
-def test_vlm_backend_refuses_when_caps_fail_after_load() -> None:
+def test_vlm_backend_refuses_when_caps_fail_after_load(tmp_path: Path) -> None:
     """Post-load cap reinstall failure must raise MemorySafetyError."""
     from mlx_model_doctor.checks.smoke import MlxVlmBackend
 
@@ -458,12 +498,12 @@ def test_vlm_backend_refuses_when_caps_fail_after_load() -> None:
 
     mx = CapsFailAfterLoadMx()
     backend = MlxVlmBackend(vlm_module=FakeVlmModule(), mx_module=mx)
-    ctx = _vlm_smoke_context()
+    ctx = _vlm_smoke_context(tmp_path)
     with pytest.raises(MemorySafetyError, match="reinstalled after VLM load"):
         backend.generate(ctx)
 
 
-def test_vlm_smoke_fails_when_text_attribute_is_none() -> None:
+def test_vlm_smoke_fails_when_text_attribute_is_none(tmp_path: Path) -> None:
     """A GenerationResult with .text=None must fail, not false-pass via str()."""
     from mlx_model_doctor.checks.smoke import MlxVlmBackend, MlxVlmSmokeCheck
 
@@ -485,7 +525,7 @@ def test_vlm_smoke_fails_when_text_attribute_is_none() -> None:
 
     backend = MlxVlmBackend(vlm_module=NoneTextVlm(), mx_module=FakeMx())
     check = MlxVlmSmokeCheck(backend=backend)
-    ctx = _vlm_smoke_context()
+    ctx = _vlm_smoke_context(tmp_path)
     result = check.run(ctx)
     assert result.status == "fail"
     assert "empty" in result.message.lower()
@@ -499,17 +539,17 @@ def test_vlm_smoke_canary_on_real_model() -> None:
     """Live: load a small VLM model through mlx-vlm and verify non-empty output + cap persistence."""
     from mlx_model_doctor.checks.smoke import MlxVlmBackend, MlxVlmSmokeCheck
     from mlx_model_doctor.memory import install_mlx_memory_caps
+    from mlx_model_doctor.targets import LocalTarget
+
+    # The cached snapshot folder, read without the Hub, checked as a local target.
+    snapshot = canary_snapshot_dir()
 
     caps_before = install_mlx_memory_caps()
     assert caps_before[0] > 0, "Memory caps must be available for the canary"
 
-    # Small, known-good VLM model pinned for the canary (mlx-community, 4-bit quantized).
     backend = MlxVlmBackend()
     check = MlxVlmSmokeCheck(backend=backend)
-    ctx = CheckContext(
-        target=FakeTarget(files={}, name="mlx-community/Qwen2.5-VL-3B-Instruct-4bit", _source="hf"),
-        options=check_options(),
-    )
+    ctx = CheckContext(target=LocalTarget(snapshot), options=check_options())
     result = check.run(ctx)
     assert result.status == "pass", f"VLM canary failed: {result.message}"
     assert result.details["generated_text_chars"] > 0
@@ -518,4 +558,148 @@ def test_vlm_smoke_canary_on_real_model() -> None:
     caps_after = install_mlx_memory_caps()
     assert caps_after == caps_before, (
         f"Memory caps drifted: before={caps_before}, after={caps_after}"
+    )
+
+
+# --- canary snapshot resolution (offline, from the local Hugging Face cache) ---
+
+CANARY_COMMIT = "46d4cf06a06ffc1a766c214174f9cbed2f45bcab"
+
+
+def test_canary_snapshot_resolution_returns_the_cached_snapshot_folder(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Bug: the canary asks the Hub for the snapshot, so it fails with the Hub unreachable
+    # although the snapshot is cached.
+    import huggingface_hub
+
+    def hub_contacted(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("the canary snapshot resolution contacted the Hub")
+
+    monkeypatch.setattr(huggingface_hub.HfApi, "repo_info", hub_contacted)
+    snapshot = write_hf_cache_snapshot(
+        tmp_path,
+        "mlx-community/Qwen2.5-VL-3B-Instruct-4bit",
+        {"config.json": b"{}"},
+        commit=CANARY_COMMIT,
+    )
+    refs = tmp_path / "models--mlx-community--Qwen2.5-VL-3B-Instruct-4bit" / "refs"
+    refs.mkdir()
+    (refs / "main").write_text(CANARY_COMMIT, encoding="utf-8")
+
+    assert canary_snapshot_dir(cache_dir=tmp_path) == snapshot
+
+
+def test_canary_snapshot_resolution_fails_naming_the_download_command_when_not_cached(
+    tmp_path: Path,
+) -> None:
+    # Bug: a missing snapshot skips the canary (a prepared --run-smoke run then reports
+    # nothing), or fails without saying how to fetch the model.
+    # BaseException, then the type: pytest.raises(Failed) would let a skip through.
+    with pytest.raises(
+        BaseException, match=r"`hf download mlx-community/Qwen2\.5-VL-3B-Instruct-4bit`"
+    ) as exc_info:
+        canary_snapshot_dir(cache_dir=tmp_path)
+
+    assert exc_info.type is pytest.fail.Exception
+
+
+# --- failure text keeps no local path (the user's home, the model folder) ---
+
+_SHA = "0123456789abcdef0123456789abcdef01234567"
+
+
+def _spaced_home_model(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, Path]:
+    """Return a fake home and a model folder below it, behind a spaced folder.
+
+    The spaced folder keeps the home cut alone from shortening the model path: without
+    the model folder passed to the reduction, the text keeps ``~/my models/m``.
+    """
+    home = tmp_path / "Users" / "John Smith"
+    model = home / "my models" / "m"
+    model.mkdir(parents=True)
+    use_fake_home(monkeypatch, home=str(home))
+    return home, model
+
+
+def test_smoke_failure_names_the_model_folder_not_its_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Bug: smoke.py copies the loader's text raw, so the message carries the home and
+    # the full model path; or it skips the target's folder and keeps "~/my models/m".
+    _home, model = _spaced_home_model(tmp_path, monkeypatch)
+    target = LocalTarget(model)
+    check = MlxLmSmokeCheck(
+        backend=FakeSmokeBackend(error=OSError(f"No safetensors found in {target.name}"))
+    )
+
+    result = check.run(CheckContext(target=target, options=check_options()))
+
+    assert result.status == "fail"
+    assert result.message == "Smoke generation failed: No safetensors found in m"
+
+
+def test_vlm_smoke_failure_names_the_file_not_its_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Bug: the VLM smoke message has no reduction at all, so a missing processor file
+    # prints the home and the whole model path.
+    from mlx_model_doctor.checks.smoke import MlxVlmSmokeCheck
+
+    _home, model = _spaced_home_model(tmp_path, monkeypatch)
+    target = LocalTarget(model)
+    missing = f"{target.name}/processor/preprocessor_config.json"
+    check = MlxVlmSmokeCheck(
+        backend=FakeSmokeBackend(error=OSError(f"No such file or directory: '{missing}'"))
+    )
+
+    result = check.run(CheckContext(target=target, options=check_options()))
+
+    assert result.message == (
+        "VLM smoke generation failed: No such file or directory: 'preprocessor_config.json'"
+    )
+
+
+def test_hf_smoke_failure_names_the_repo_not_the_cache_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Bug: `check hf --smoke` prints the cache snapshot path, which the user never typed
+    # and which holds their home.
+    home = tmp_path / "Users" / "John Smith"
+    use_fake_home(monkeypatch, home=str(home))
+    snapshot = home / ".cache" / "huggingface" / "hub" / "models--o--n" / "snapshots" / _SHA
+    error = OSError(f"{snapshot}/config.json not found; snapshot {snapshot}")
+    target = HfTarget("o/n", hub=FakeShardHub(files={}, shards={}))
+    check = MlxLmSmokeCheck(backend=FakeSmokeBackend(error=error))
+
+    result = check.run(CheckContext(target=target, options=check_options()))
+
+    assert result.message == "Smoke generation failed: config.json not found; snapshot o/n"
+
+
+def test_smoke_failure_for_a_missing_model_folder_names_only_the_folder(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Bug: the NotADirectoryError from the guard embeds the typed model path, and the
+    # smoke message prints it with the home.
+    home = tmp_path / "Users" / "John Smith"
+    missing = home / "my models" / "gone"
+    use_fake_home(monkeypatch, home=str(home))
+    mx = FakeMx()
+    mlx_lm = FakeMlxLm(mx)
+
+    def import_module(name: str) -> object:
+        if name == "mlx.core":
+            return mx
+        if name == "mlx_lm":
+            return mlx_lm
+        raise ImportError(name)
+
+    monkeypatch.setattr(smoke_module.importlib, "import_module", import_module)
+    target = FakeTarget(files={}, name=str(missing))
+
+    result = MlxLmSmokeCheck().run(CheckContext(target=target, options=check_options()))
+
+    assert result.message == (
+        "Smoke generation failed: model path is not an existing directory: gone"
     )

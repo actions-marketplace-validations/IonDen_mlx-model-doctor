@@ -17,13 +17,24 @@ a crash can be told apart from an ordinary, confidently-reached ``fail``
 import traceback
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Protocol
+from pathlib import Path
+from typing import TYPE_CHECKING, Protocol
 
+from mlx_model_doctor.checks.remote_code import (
+    MLX_LM_KEYS,
+    describe_refusal,
+    find_remote_code,
+    refusal_remediation,
+)
 from mlx_model_doctor.errors import ModelDoctorError, TargetError, raise_for_hf_target_error
 from mlx_model_doctor.parity.context import ParityContext, tokenizers_match
 from mlx_model_doctor.parity.resolver import ResolvedTargets, resolve_targets
+from mlx_model_doctor.redaction import redact_local_paths, target_model_dirs
 from mlx_model_doctor.report import CheckResult
 from mlx_model_doctor.safetensors_header import SafetensorsHeader
+
+if TYPE_CHECKING:
+    from mlx_model_doctor.targets import ModelTarget
 
 # Suffixes stripped from a safetensors tensor name to recover its owning
 # module's path, matching MLX's nn.QuantizedLinear/nn.Linear parameter
@@ -33,8 +44,8 @@ _TENSOR_PAYLOAD_SUFFIXES = (".weight", ".scales", ".biases")
 # Standalone LoRA/DoRA factor tensor suffixes a genuinely fused checkpoint
 # must no longer carry for a target it has baked in (mlx_lm.tuner writes
 # these under `{target}.lora_a` / `{target}.lora_b` / DoRA's `{target}.m`).
-# Mirrors mlx-lm's current naming (pinned mlx-lm==0.31.3, same version the
-# resolver and worker modules verify against); a future mlx-lm rename of
+# Mirrors mlx-lm's current naming (verified against mlx-lm 0.31.3 and 0.32.2 on
+# 2026-10-24, the same lines the resolver verifies against); a future mlx-lm rename of
 # these attributes would need a matching update here.
 _LORA_FACTOR_SUFFIXES = (".lora_a", ".lora_b", ".m")
 
@@ -126,17 +137,25 @@ def run_parity_checks(
             details: dict[str, object] = {}
             if pctx.options.verbosity == "verbose":
                 details["traceback"] = traceback.format_exc()
+            targets = pctx.targets
+            model_dirs = _model_dirs(targets.base, targets.adapter, targets.fused)
+            reason = redact_local_paths(str(exc), model_dirs=model_dirs)
             results.append(
                 CheckResult(
                     check_id=_safe_parity_check_id(check),
                     title=check.title,
                     status="fail",
                     severity="high",
-                    message=f"check crashed: {exc}",
+                    message=f"check crashed: {reason}",
                     details=details,
                 )
             )
     return results, crashed
+
+
+def _model_dirs(*targets: "ModelTarget") -> tuple[Path, ...]:
+    """Return the local model folders of ``targets``, for the path reduction."""
+    return tuple(model_dir for target in targets for model_dir in target_model_dirs(target))
 
 
 def _strip_tensor_payload_suffix(tensor_name: str) -> str:
@@ -499,4 +518,70 @@ class TokenizerIdentityCheck:
                 "Metadata-only difference (common after mlx_lm.fuse re-serializes "
                 "tokenizer_config.json); confirm it is expected."
             ),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class RemoteCodeCheck:
+    """Check that neither model the parity workers load names its own loader code.
+
+    The base and fused directories are loaded through ``mlx_lm.load`` in the workers;
+    a directory whose config.json names a ``model_file`` (mlx-lm imports it with no gate),
+    or whose config.json cannot be read, fails here, before any worker runs. An
+    ``auto_map`` does not: the workers pin ``trust_remote_code`` off. The adapter directory is
+    not loaded as a model: mlx-lm 0.31.3 ``tuner/utils.py`` ``load_adapters`` reads
+    only ``adapter_config.json`` as JSON and ``adapters.safetensors`` as weights.
+    """
+
+    check_id: str = "parity/load.remote_code"
+    title: str = "Repository loader code"
+
+    def run(self, pctx: ParityContext) -> CheckResult:
+        """Run the remote-code guard on the base and fused model directories."""
+        refusals = [
+            (role, refusal)
+            for role, target in (("base", pctx.targets.base), ("fused", pctx.targets.fused))
+            if (refusal := find_remote_code(Path(target.name), keys=MLX_LM_KEYS)) is not None
+        ]
+        if not refusals:
+            return CheckResult(
+                check_id=self.check_id,
+                title=self.title,
+                status="pass",
+                severity="info",
+                message="Neither the base nor the fused repository names its own loader code.",
+            )
+        details: dict[str, object] = {"refused_targets": tuple(role for role, _ in refusals)}
+        sentences: list[str] = []
+        remediations: list[str] = []
+        # A not_a_directory refusal names the model folder itself, as an absolute path.
+        model_dirs = _model_dirs(pctx.targets.base, pctx.targets.fused)
+        for role, refusal in refusals:
+            details[f"{role}_remote_code_file"] = redact_local_paths(
+                refusal.file, model_dirs=model_dirs
+            )
+            if refusal.key is None:
+                details[f"{role}_remote_code_unreadable"] = True
+                if refusal.reason == "dangling_link":
+                    details[f"{role}_remote_code_dangling_link"] = True
+            else:
+                details[f"{role}_remote_code_key"] = refusal.key
+            sentence = describe_refusal(refusal, subject=f"the {role} repository")
+            sentences.append(redact_local_paths(sentence, model_dirs=model_dirs))
+            if (remediation := refusal_remediation(refusal)) not in remediations:
+                remediations.append(remediation)
+        named = all(refusal.key is not None for _, refusal in refusals)
+        sentences.append(
+            "The load was refused, so that code was not run."
+            if named
+            else "The load was refused, so repository code was not run."
+        )
+        return CheckResult(
+            check_id=self.check_id,
+            title=self.title,
+            status="fail",
+            severity="high",
+            message=" ".join(sentences),
+            remediation=" ".join(remediations),
+            details=details,
         )
